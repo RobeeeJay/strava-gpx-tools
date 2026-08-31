@@ -1,0 +1,19 @@
+[project]
+name = "geepeex"
+version = "0.1.0"
+description = "Tools for fetching and visualising GPX tracks"
+requires-python = ">=3.10"
+dependencies = ["requests>=2.31"]
+
+[project.scripts]
+gpx = "geepeex.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

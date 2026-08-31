@@ -6,8 +6,9 @@ import os
 import sys
 from collections import Counter
 
-from . import coverage, mapview, strava
-from .gpxfile import NoGpsData, build_gpx, filename_for, parse_strava_time, read_points, read_tracks
+from . import charts, coverage, mapview, rideprofile, strava
+from .gpxfile import (NoGpsData, build_gpx, filename_for, parse_strava_time,
+                      read_points, read_samples, read_tracks)
 
 DEFAULT_OUT = "gpx"
 
@@ -207,6 +208,130 @@ def cmd_coverage(args):
     return 0
 
 
+def _stride(values, count):
+    if len(values) <= count:
+        return values
+    step = len(values) / count
+    return [values[min(len(values) - 1, int(i * step))] for i in range(count)] + [values[-1]]
+
+
+def cmd_profile(args):
+    if not os.path.isfile(args.gpx):
+        raise strava.StravaError(f"not found: {args.gpx}")
+    segments = read_samples(args.gpx)
+    result = rideprofile.analyse(
+        segments,
+        smoothing=args.smoothing,
+        window=args.window,
+        mass=args.mass,
+        cda=args.cda,
+        crr=args.crr,
+    )
+    signal = rideprofile.fatigue(result)
+
+    n = args.points
+    km = [d / 1000 for d in _stride(result["distance"], n)]
+    x_max = km[-1]
+    ele = _stride(result["elevation_smoothed"], n)
+    speed = [v * 3.6 for v in _stride(result["speed"], n)]
+    flat = [v * 3.6 for v in _stride(result["flat_speed"], n)]
+    grade = [g * 100 for g in _stride(result["grade"], n)]
+    elapsed = _stride(result["elapsed"], n)
+
+    # The fit is drawn across the same x samples as the data it explains, so the
+    # crosshair can read both from one index.
+    (x0, y0), (x1, y1) = signal["trend"]
+    trend = [y0 + (y1 - y0) * (d * 1000 - x0) / ((x1 - x0) or 1) for d in km]
+
+    geometry = {"w": charts.W, "left": charts.LEFT, "right": charts.RIGHT}
+    geom = {}
+    blocks = []
+    for spec in (
+        ("elevation", "Elevation", "metres", [("Elevation", ele, 0)], True),
+        ("speed", "Speed", "km/h, measured over %g m" % args.window,
+         [("Speed", speed, 0)], False),
+        ("flat", "Gradient-adjusted speed", "km/h the same effort would give on the flat",
+         [("Flat-equivalent", flat, 0), ("Fitted trend", trend, 1)], False),
+    ):
+        chart_id, title, unit, series, fill = spec
+        html, part = charts.line_chart(chart_id, title, unit, km, series, x_max, fill=fill)
+        blocks.append(html)
+        geom.update(part)
+
+    change = signal["end_kmh"] - signal["start_kmh"]
+    percent = 100 * change / signal["start_kmh"] if signal["start_kmh"] else 0.0
+    climb = sum(max(0.0, b - a) for a, b in zip(result["elevation_smoothed"],
+                                                result["elevation_smoothed"][1:]))
+    moving = sum(1 for p in result["propulsive"] if p) / len(result["propulsive"])
+
+    tiles = "".join(
+        f'<div class="tile"><div class="label">{label}</div>'
+        f'<div class="value{hero}">{value}</div><div class="note">{note}</div></div>'
+        for label, value, note, hero in (
+            ("Fade over the ride", f"{change:+.1f} km/h",
+             f"{percent:+.1f}% flat-equivalent, fitted start to finish", " hero"),
+            ("Per 10 km", f"{signal['per_10km_kmh']:+.2f} km/h", "slope of the fitted trend", ""),
+            ("First quarter", f"{signal['quarters'][0]['flat_kmh']:.1f} km/h",
+             f"actual {signal['quarters'][0]['actual_kmh']:.1f} km/h", ""),
+            ("Last quarter", f"{signal['quarters'][-1]['flat_kmh']:.1f} km/h",
+             f"actual {signal['quarters'][-1]['actual_kmh']:.1f} km/h", ""),
+            ("Distance", f"{x_max:.1f} km", f"{climb:.0f} m climbed", ""),
+            ("Pedalling", f"{100 * moving:.0f}%",
+             "of samples propulsive; the rest is coasting or stopped", ""),
+        )
+    )
+
+    rows = "".join(
+        f"<tr><td>{q['from_km']:.1f}&ndash;{q['to_km']:.1f} km</td>"
+        f"<td>{q['actual_kmh']:.1f}</td><td>{q['flat_kmh']:.1f}</td></tr>"
+        for q in signal["quarters"]
+    )
+    table = (
+        "<details><summary>The numbers behind the fade</summary>"
+        "<table><thead><tr><th>Quarter</th><th>Actual km/h</th>"
+        "<th>Flat-equivalent km/h</th></tr></thead><tbody>"
+        + rows
+        + "</tbody></table></details>"
+    )
+
+    p = result["params"]
+    foot = (
+        "Gradient-adjusted speed solves for the power implied by the observed speed and "
+        f"gradient, then asks what that power would give on the flat. It assumes "
+        f"<code>{p['mass']:g} kg</code> total, <code>CdA {p['cda']:g}</code>, "
+        f"<code>Crr {p['crr']:g}</code>, no wind and no drafting. The absolute numbers move "
+        "with those guesses; the trend across the ride is much less sensitive to them. "
+        "Coasting and stopped samples are excluded, so a descent-heavy finish is not "
+        "read as fatigue &mdash; but wind, traffic and deliberate pacing still are."
+    )
+
+    charts.page(
+        args.out,
+        title=args.title or os.path.splitext(os.path.basename(args.gpx))[0],
+        subtitle=f"{x_max:.1f} km, {climb:.0f} m climbed, "
+                 f"{signal['quarters'][0]['actual_kmh']:.1f} km/h in the first quarter "
+                 f"to {signal['quarters'][-1]['actual_kmh']:.1f} in the last",
+        tiles=f'<div class="tiles">{tiles}</div>',
+        charts="".join(blocks),
+        table=table,
+        foot=foot,
+        data={"km": [round(v, 3) for v in km], "ele": [round(v, 1) for v in ele],
+              "speed": [round(v, 2) for v in speed], "flat": [round(v, 2) for v in flat],
+              "grade": [round(v, 2) for v in grade], "elapsed": [round(v) for v in elapsed],
+              "geom": geom},
+        geometry=geometry,
+    )
+
+    print(f"{x_max:.1f} km, {climb:.0f} m climbed")
+    for q in signal["quarters"]:
+        print(f"  {q['from_km']:5.1f}-{q['to_km']:5.1f} km   actual {q['actual_kmh']:5.1f}"
+              f"   flat-equivalent {q['flat_kmh']:5.1f} km/h")
+    print(f"\nFitted fade {change:+.1f} km/h ({percent:+.1f}%), "
+          f"{signal['per_10km_kmh']:+.2f} km/h per 10 km")
+    print(f"Wrote {os.path.abspath(args.out)}")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="gpx", description="Tools for GPX tracks.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -236,9 +361,26 @@ def main(argv=None):
     c.add_argument("--title", help="page title (default: the main file name)")
     c.set_defaults(func=cmd_coverage)
 
+    f = sub.add_parser("profile", help="elevation, speed and gradient-adjusted speed for one ride")
+    f.add_argument("gpx", help="GPX file of the ride")
+    f.add_argument("-o", "--out", default="profile.html", help="output HTML (default: profile.html)")
+    f.add_argument("--mass", type=float, help="rider plus bike, kg (default: 85)")
+    f.add_argument("--cda", type=float, help="drag area, m^2 (default: 0.32)")
+    f.add_argument("--crr", type=float, help="rolling resistance (default: 0.005)")
+    f.add_argument("--smoothing", type=float, default=100.0,
+                   help="metres to smooth elevation over before taking gradient (default: 100)")
+    f.add_argument("--window", type=float, default=200.0,
+                   help="metres over which speed and gradient are both measured (default: 200)")
+    f.add_argument("--points", type=int, default=1500, help="samples plotted (default: 1500)")
+    f.add_argument("--title", help="page title (default: the file name)")
+    f.set_defaults(func=cmd_profile)
+
     args = parser.parse_args(argv)
     try:
         return args.func(args)
+    except rideprofile.NotEnoughData as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     except strava.StravaError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

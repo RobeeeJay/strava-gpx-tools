@@ -134,3 +134,46 @@ The two layers go in explicit Leaflet panes (`trainingPane` 410, `routePane`
 layer in the control re-adds it, which would otherwise lift the grey above the
 colouring the page exists to show. The z values sit between Leaflet's own
 overlayPane (400) and shadowPane (500).
+
+## Ride profile and fatigue (`gpx profile`)
+
+The gradient adjustment is a physics model, not a lookup table. It solves for
+the power implied by the observed speed and gradient, then asks what that power
+would give on the flat. Absolute watts depend on the assumed mass, CdA and Crr,
+which are guesses; the trend across one ride is far less sensitive to them, so
+the headline is reported as a change and never as a number of watts.
+
+The whole command is validated against a ground truth it never sees: the tests
+simulate rides with the *forward* model at a known declining power and check
+that `analyse` inverts it. On a 40 km simulation fading 220 W to 180 W the tool
+recovers -2.6 km/h against a ground truth of -2.6 km/h, and reports the closing
+4% climb as a 15.7 km/h quarter that is still 32.3 km/h flat-equivalent. Keep
+that style of test: an assertion against real physics beats an assertion against
+whatever the code happened to print.
+
+Two measurement decisions look like fussiness and are not:
+
+- **Speed and gradient share one window.** Measuring them over different spans
+  biases the power estimate wherever speed is at a local extreme, which put a
+  spike on every descent — 19 outliers in a 5791-sample simulation, down to a
+  handful once the windows matched.
+- **Gradient is a least-squares slope over that window,** not the difference of
+  a smoothed elevation trace. Differencing a moving average flattens wherever
+  the window stops sliding, which read a sustained 4% finishing climb as 3.0%
+  and invented a fade. `--smoothing` now only affects the displayed elevation
+  trace and the climb total.
+
+Two things were tried and removed, both because measurement did not support
+them. Sliding the window inwards at the ends instead of letting it shrink: once
+the gradient came from a least-squares slope this changed the finishing gradient
+by 0.01% and the fade by 0.02 km/h. Weighting the trend fit by distance rather
+than by sample, on the reasoning that time-uniform samples over-represent slow
+ground: measured against simulated rides with a known fade it was no better than
+plain least squares even with 56% of the samples falling in 17% of the road,
+because the lever arm of the fit dominates sample density. Do not reintroduce
+either without a measurement showing it matters.
+
+Charts are generated as SVG in Python with only the crosshair done in
+JavaScript, so the page has no chart-library dependency and what is drawn is
+exactly what was measured. Colours are slots 1 and 2 of the reference
+categorical palette, validated for both light and dark surfaces.

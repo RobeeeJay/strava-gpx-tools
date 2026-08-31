@@ -9,6 +9,7 @@ subcommand of `gpx`.
 | --- | --- |
 | `gpx strava` | Download matching Strava activities as GPX into `./gpx` |
 | `gpx coverage` | Colour a route by whether you have ridden it in training, as a webpage |
+| `gpx profile` | Elevation, speed and gradient-adjusted speed for one ride, as a webpage |
 
 ## Requirements
 
@@ -26,7 +27,8 @@ Then run the CLI with `uv run gpx …`, or install it on your path with
 
     uv run gpx strava                                   # download some tracks
     uv run gpx coverage gpx/big-ride.gpx "gpx/*.gpx"    # see what you have ridden
-    open coverage.html
+    uv run gpx profile gpx/big-ride.gpx                 # see how one ride went
+    open coverage.html profile.html
 
 ---
 
@@ -155,6 +157,65 @@ route the error is far below the GPS tolerance being worked to.
 
 The page is Leaflet over OpenStreetMap tiles. Both layers can be toggled, and
 the route always draws above the grey regardless of toggle order.
+
+---
+
+## `gpx profile`
+
+Three charts against distance for a single ride: elevation, speed, and speed
+adjusted for gradient — plus what that says about fading.
+
+    gpx profile ride.gpx -o profile.html
+
+![Elevation, speed and gradient-adjusted speed charts for a ride](docs/profile-example.jpg)
+
+*Again a simulated ride, not a real one — 220 W declining to 180 W over 40 km,
+with a sustained climb in the last quarter. It is the fixture the tests use.*
+
+The picture that example makes is the point of the tool. Raw speed swings
+between 20 and 50 km/h with the rolling ground and collapses to 16 km/h on the
+closing climb, which tells you about the road rather than the rider. The
+gradient-adjusted line is a clean decline from 34.6 to 32.0 km/h: the fade that
+was actually there.
+
+### How the adjustment works
+
+From the observed speed and the local gradient it solves for the power the
+rider must have been producing:
+
+    P = v · ( m·g·(Crr·cos θ + sin θ) + ½·ρ·CdA·v² ) / efficiency
+
+then asks what speed that same power would give on level ground. That
+flat-equivalent speed is comparable across the whole ride, so a decline in it is
+a decline in the rider rather than a change in the road.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `-o, --out` | `profile.html` | Output file |
+| `--mass` | 85 kg | Rider plus bike |
+| `--cda` | 0.32 m² | Drag area — road bike on the hoods |
+| `--crr` | 0.005 | Rolling resistance |
+| `--window` | 200 m | Span over which speed **and** gradient are measured |
+| `--smoothing` | 100 m | Span the displayed elevation trace is smoothed over |
+| `--points` | 1500 | Samples plotted |
+
+### What it does and does not tell you
+
+The absolute numbers move with the assumed mass and drag, which are guesses.
+The *trend across one ride* is far less sensitive to them, which is why the
+headline is a change and not a number of watts.
+
+Coasting, braking and stopped samples are excluded from the trend, so a
+descent-heavy finish is not misread as fatigue. Wind, drafting, traffic lights
+and deliberate pacing are **not** accounted for and will show up as fade. A
+tailwind out and a headwind back looks exactly like getting tired.
+
+Speed and gradient are deliberately measured over the same window. Measuring
+them over different spans biases the power estimate wherever speed is at a local
+extreme, which put a visible spike on every descent. The gradient is a
+least-squares slope over that window rather than the difference of a smoothed
+elevation trace: differencing a moving average flattens off at the ends, which
+read a steady 4% finishing climb as 3% and invented a fade that was not there.
 
 ---
 

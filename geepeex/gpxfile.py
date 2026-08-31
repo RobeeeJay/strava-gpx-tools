@@ -108,3 +108,32 @@ def read_points(path):
     """All tracks in a file flattened into one point list, for a route that is
     logically continuous but split across segments."""
     return [point for track in read_tracks(path) for point in track]
+
+
+def read_samples(path):
+    """Segments of (lat, lon, elevation, time), keeping whatever is present.
+
+    Elevation and time are None where the file omits them. Segments stay apart
+    because speed across a paused recording is meaningless.
+    """
+    import xml.etree.ElementTree as ET
+
+    root = ET.parse(path).getroot()
+    segments = []
+    for parent in root.iter():
+        if _local(parent.tag) != "trkseg":
+            continue
+        points = []
+        for child in parent:
+            if _local(child.tag) != "trkpt" or not child.get("lat"):
+                continue
+            ele = time = None
+            for field in child:
+                if _local(field.tag) == "ele" and field.text:
+                    ele = float(field.text)
+                elif _local(field.tag) == "time" and field.text:
+                    time = parse_strava_time(field.text.strip())
+            points.append((float(child.get("lat")), float(child.get("lon")), ele, time))
+        if len(points) >= 2:
+            segments.append(points)
+    return segments

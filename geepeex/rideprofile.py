@@ -83,6 +83,56 @@ def flat_equivalent_speed(power, mass, cda, crr, efficiency, rho):
     return (lo + hi) / 2
 
 
+def gradient(distance, elevation, spans, window=200.0, max_grade=0.30):
+    """Gradient as a least-squares slope of elevation on distance over a window.
+
+    Not the difference of a smoothed elevation trace: a moving average flattens
+    wherever its window stops sliding, which read a sustained 4% finishing climb
+    as 3%.
+    """
+    cx, cy, cxx, cxy = [0.0], [0.0], [0.0], [0.0]
+    for d, e in zip(distance, elevation):
+        cx.append(cx[-1] + d)
+        cy.append(cy[-1] + e)
+        cxx.append(cxx[-1] + d * d)
+        cxy.append(cxy[-1] + d * e)
+
+    grade = [0.0] * len(distance)
+    for first, last in spans:
+        for i in range(first, last + 1):
+            lo, hi = _edges(distance, i, window, first, last)
+            count = hi + 1 - lo
+            sx = cx[hi + 1] - cx[lo]
+            sy = cy[hi + 1] - cy[lo]
+            denom = count * (cxx[hi + 1] - cxx[lo]) - sx * sx
+            slope = (count * (cxy[hi + 1] - cxy[lo]) - sx * sy) / denom if denom else 0.0
+            grade[i] = max(-max_grade, min(max_grade, slope))
+    return grade
+
+
+def speed_for_power(power, grade, mass, cda, crr, efficiency, rho, max_speed=18.0):
+    """The forward model: what speed this power sustains on this gradient.
+
+    Bisection again, and again because resistance is monotonic in speed once
+    gravity is fixed. On a descent gravity alone can carry the rider past any
+    speed they would actually hold, so the result is capped: the model has no
+    notion of braking, cornering or self-preservation.
+    """
+    theta = math.atan(grade)
+    gravity = mass * G * (crr * math.cos(theta) + math.sin(theta))
+    target = power * efficiency
+    lo, hi = 0.0, max_speed
+    if lo * gravity + 0.5 * rho * cda * lo**3 >= target and gravity >= 0:
+        return 0.0
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        if mid * gravity + 0.5 * rho * cda * mid**3 < target:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
 def analyse(segments, smoothing=100.0, window=200.0, min_speed=1.0,
             max_grade=0.30, **physics):
     """Per-sample distance, elevation, speed, gradient and flat-equivalent speed.
@@ -127,32 +177,17 @@ def analyse(segments, smoothing=100.0, window=200.0, min_speed=1.0,
     # 4% finishing climb as 3%.
     smoothed = _window_mean(distance, elevation, smoothing, spans)
 
-    n = len(distance)
-    cx, cy, cxx, cxy = [0.0], [0.0], [0.0], [0.0]
-    for d, e in zip(distance, elevation):
-        cx.append(cx[-1] + d)
-        cy.append(cy[-1] + e)
-        cxx.append(cxx[-1] + d * d)
-        cxy.append(cxy[-1] + d * e)
+    grade = gradient(distance, elevation, spans, window, max_grade)
 
-    # Speed and gradient are measured over the *same* span of road. Measuring
+    # Speed is measured over the *same* span of road as the gradient. Measuring
     # them over different spans biases the power estimate wherever speed is at a
     # local extreme, which put a spike on every descent.
-    speed = [0.0] * n
-    grade = [0.0] * n
+    speed = [0.0] * len(distance)
     for first, last in spans:
         for i in range(first, last + 1):
             lo, hi = _edges(distance, i, window, first, last)
             dt = elapsed[hi] - elapsed[lo]
-            run = distance[hi] - distance[lo]
-            speed[i] = run / dt if dt > 0 else 0.0
-
-            count = hi + 1 - lo
-            sx = cx[hi + 1] - cx[lo]
-            sy = cy[hi + 1] - cy[lo]
-            denom = count * (cxx[hi + 1] - cxx[lo]) - sx * sx
-            slope = (count * (cxy[hi + 1] - cxy[lo]) - sx * sy) / denom if denom else 0.0
-            grade[i] = max(-max_grade, min(max_grade, slope))
+            speed[i] = (distance[hi] - distance[lo]) / dt if dt > 0 else 0.0
 
     power, flat, moving = [], [], []
     for v, g in zip(speed, grade):

@@ -42,3 +42,17 @@ def test_the_page_uses_the_validated_series_colours():
         assert colour in charts.PAGE
     for colour in charts.SERIES_DARK:
         assert colour in charts.PAGE
+
+
+def test_the_axis_is_not_stretched_past_the_data_for_a_round_number():
+    # A 42 km ride must not push the axis out to 50 and waste a fifth of the plot.
+    html, geom = charts.line_chart("d", "D", "u", [0, 21, 42],
+                                   [("D", [1, 2, 3], 0)], 42)
+    assert ">50<" not in html
+    assert ">40<" in html
+
+
+def test_a_ride_ending_just_short_of_a_round_number_still_labels_it():
+    html, _ = charts.line_chart("e", "E", "u", [0, 20, 39.99],
+                                [("E", [1, 2, 3], 0)], 39.99)
+    assert ">40<" in html

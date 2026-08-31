@@ -49,7 +49,10 @@ def line_chart(chart_id, title, unit, x, series, x_max, y_lo=None, y_hi=None, fi
     pad = (hi - lo) * 0.08 or 1.0
     lo, hi = lo - pad, hi + pad
 
-    x_ticks = nice_ticks(0, x_max, cover=True)
+    # Cover the end of the data so a 39.99 km ride still shows its 40 label,
+    # but only just: a 42 km ride must not stretch the axis out to 50 and leave
+    # a fifth of the plot empty.
+    x_ticks = [t for t in nice_ticks(0, x_max, cover=True) if t <= x_max * 1.002]
     sx = _scale(0, max(x_max, x_ticks[-1]), LEFT, W - RIGHT)
     sy = _scale(lo, hi, H - BOTTOM, TOP)
 

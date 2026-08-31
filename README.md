@@ -10,6 +10,7 @@ subcommand of `gpx`.
 | `gpx strava` | Download matching Strava activities as GPX into `./gpx` |
 | `gpx coverage` | Colour a route by whether you have ridden it in training, as a webpage |
 | `gpx profile` | Elevation, speed and gradient-adjusted speed for one ride, as a webpage |
+| `gpx predict` | Predict how long a route will take, from your recent rides |
 
 ## Requirements
 
@@ -28,7 +29,8 @@ Then run the CLI with `uv run gpx …`, or install it on your path with
     uv run gpx strava                                   # download some tracks
     uv run gpx coverage gpx/big-ride.gpx "gpx/*.gpx"    # see what you have ridden
     uv run gpx profile gpx/big-ride.gpx                 # see how one ride went
-    open coverage.html profile.html
+    uv run gpx predict route.gpx "gpx/*.gpx"            # see how long a route will take
+    open coverage.html profile.html predict.html
 
 ---
 
@@ -219,6 +221,75 @@ read a steady 4% finishing climb as 3% and invented a fade that was not there.
 
 ---
 
+## `gpx predict`
+
+How long will this route take, given how you have actually been riding? Takes
+the same arguments as `gpx coverage` — a route, and a glob of rides to learn
+from — and produces the same three charts as `gpx profile`, except predicted
+rather than measured.
+
+    gpx predict route.gpx "gpx/*.gpx" -o predict.html
+
+![Predicted time, speed and gradient-adjusted speed for a route](docs/predict-example.jpg)
+
+Each training ride is reduced to two numbers: the power it started at, and how
+fast that power decayed as the ride went on. Those are averaged across rides
+with recent ones counting for more, then played forward over the target route's
+gradients, spending the modelled power against each one in turn.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `-o, --out` | `predict.html` | Output file |
+| `--half-life` | 42 days | How fast a ride's influence decays |
+| `--min-minutes` | 20 | Ignore training rides shorter than this |
+| `--mass`, `--cda`, `--crr` | 85 kg, 0.32, 0.005 | The same physics as `gpx profile` |
+| `--window` | 200 m | Span over which speed and gradient are measured |
+
+Recency is weighted by duration as well as by age. A twenty-minute ride cannot
+show a fade, and the fade is half of what is being fitted.
+
+### How well does it work
+
+Well enough to be worth having, and it is measurable. The tests simulate a
+rider at a known power with a known fade, generate a training history, then
+predict a route the model has never seen and compare against that same rider's
+actual time. For a rider whose form is steady, the prediction is exact:
+
+| | |
+| --- | --- |
+| Simulated rider | 230 W start, −18 W/hour |
+| Recovered from training | 230 W start, −18.1 W/hour |
+| True time on the unseen route | 1h 31m |
+| Predicted | 1h 31m |
+
+**It lags a rider whose form is changing**, and by a knowable amount. Repeating
+that experiment with a rider improving by 15 W a week:
+
+| Estimator | Predicted | vs the truth of 1h 31m |
+| --- | --- | --- |
+| Newest ride alone | 1h 35m | +4 min, and irreducible — the newest ride is a week old |
+| `--half-life 14` | 1h 42m | +11 min |
+| `--half-life 42` (default) | 1h 45m | +14 min |
+
+A weighted average of past rides can never exceed the best of them, so a rider
+on an upward trend will always be predicted slower than they are. Shorten
+`--half-life` if you are improving fast; the cost is that fewer rides carry the
+estimate, so it gets noisier.
+
+### What it does not know
+
+It predicts **moving** time: no stops, no traffic lights, no cafe. It knows
+nothing about wind, drafting, road surface, or how hard you decide to go on the
+day. The power figures are estimates from a model whose mass and drag are
+guesses, so treat them as a way of comparing routes rather than a number of
+watts.
+
+The page says so when the prediction runs past its evidence: if the route is
+predicted to take longer than the longest ride it learned from, the fade beyond
+that point is extrapolation and is called out as such.
+
+---
+
 ## Tests
 
     uv run --extra dev pytest
@@ -236,6 +307,8 @@ page rendering) against literal fixtures.
 | `geepeex/gpxfile.py` | Reading and writing GPX |
 | `geepeex/coverage.py` | Deciding which parts of a route were ridden, and which way |
 | `geepeex/mapview.py` | Rendering a coverage result as a Leaflet page |
+| `geepeex/predict.py` | Fitness from past rides, played forward over a route |
+| `geepeex/charts.py` | The stacked line charts the profile and predict pages use |
 
 `CLAUDE.md` records why things are the way they are, including the Strava
 gotchas that cost time to find.

@@ -6,7 +6,7 @@ import os
 import sys
 from collections import Counter
 
-from . import charts, coverage, mapview, rideprofile, strava
+from . import charts, coverage, mapview, predict, rideprofile, strava
 from .gpxfile import (NoGpsData, build_gpx, filename_for, parse_strava_time,
                       read_points, read_samples, read_tracks)
 
@@ -332,6 +332,172 @@ def cmd_profile(args):
     return 0
 
 
+def _hhmm(seconds):
+    hours, rest = divmod(int(seconds), 3600)
+    return f"{hours}h {rest // 60:02d}m" if hours else f"{rest // 60}m"
+
+
+def cmd_predict(args):
+    if not os.path.isfile(args.route):
+        raise strava.StravaError(f"route not found: {args.route}")
+    route = [p for seg in read_samples(args.route) for p in seg]
+    if len(route) < 2:
+        raise strava.StravaError(f"{args.route} has no track points")
+    if any(p[2] is None for p in route):
+        raise strava.StravaError(f"{args.route} has no elevation; gradient cannot be derived")
+
+    training_files = _expand(args.training, exclude=[args.route])
+    if not training_files:
+        raise strava.StravaError("no training files matched")
+
+    physics = {k: v for k, v in (("mass", args.mass), ("cda", args.cda), ("crr", args.crr))
+               if v is not None}
+    params = dict(rideprofile.DEFAULTS, **physics)
+
+    rides, skipped = [], []
+    for path in training_files:
+        try:
+            result = rideprofile.analyse(read_samples(path), window=args.window, **physics)
+            fit = predict.ride_fitness(result)
+        except (rideprofile.NotEnoughData, predict.NotEnoughRides) as exc:
+            skipped.append((path, str(exc)))
+            continue
+        if fit is None:
+            skipped.append((path, "too few propulsive samples"))
+        elif fit["hours"] * 60 < args.min_minutes:
+            skipped.append((path, f"shorter than {args.min_minutes:g} minutes"))
+        else:
+            fit["path"] = path
+            fit["date"] = _ride_date(path)
+            rides.append(fit)
+
+    for path, why in skipped:
+        print(f"  skipped {os.path.basename(path)}: {why}")
+    if not rides:
+        raise predict.NotEnoughRides("no training ride was usable")
+
+    fit = predict.fitness(rides, half_life_days=args.half_life)
+    forecast = predict.predict(
+        [(p[0], p[1]) for p in route], [p[2] for p in route], fit, params,
+        window=args.window, smoothing=args.smoothing,
+    )
+
+    n = args.points
+    km = [d / 1000 for d in _stride(forecast["distance"], n)]
+    x_max = km[-1]
+    ele = _stride(forecast["elevation_smoothed"], n)
+    speed = [v * 3.6 for v in _stride(forecast["speed"], n)]
+    flat = [v * 3.6 for v in _stride(forecast["flat_speed"], n)]
+    grade = [g * 100 for g in _stride(forecast["grade"], n)]
+    elapsed = _stride(forecast["elapsed"], n)
+
+    geom, blocks = {}, []
+    for chart_id, title, unit, series, fill in (
+        ("elevation", "Elevation", "metres", [("Elevation", ele, 0)], True),
+        ("speed", "Predicted speed", "km/h on this route", [("Predicted", speed, 0)], False),
+        ("flat", "Predicted gradient-adjusted speed",
+         "km/h on the flat: the modelled fade, with the road taken out",
+         [("Flat-equivalent", flat, 0)], False),
+    ):
+        html, part = charts.line_chart(chart_id, title, unit, km, series, x_max, fill=fill)
+        blocks.append(html)
+        geom.update(part)
+
+    seconds = forecast["seconds"]
+    climb = sum(max(0.0, b - a) for a, b in zip(forecast["elevation_smoothed"],
+                                                forecast["elevation_smoothed"][1:]))
+    hours = seconds / 3600
+    beyond = hours > fit["longest_hours"]
+
+    tiles = "".join(
+        f'<div class="tile"><div class="label">{label}</div>'
+        f'<div class="value{hero}">{value}</div><div class="note">{note}</div></div>'
+        for label, value, note, hero in (
+            ("Predicted moving time", _hhmm(seconds),
+             "no stops, no wind, no traffic", " hero"),
+            ("Average speed", f"{x_max / hours:.1f} km/h", f"over {x_max:.1f} km", ""),
+            ("Climbing", f"{climb:.0f} m", "on the route as recorded", ""),
+            ("Modelled power", f"{fit['start_watts']:.0f} to "
+                               f"{forecast['power'][-1]:.0f} W",
+             "estimate, and only as good as the assumed mass and drag", ""),
+            ("Fitness from", f"{len(rides)} rides",
+             f"half-life {fit['half_life_days']:g} days; newest "
+             f"{fit['rides'][0]['date'].date()}", ""),
+            ("Longest training ride", _hhmm(fit["longest_hours"] * 3600),
+             "beyond this the fade is extrapolated" if beyond
+             else "the prediction stays inside this", ""),
+        )
+    )
+
+    rows = "".join(
+        f"<tr><td>{r['date'].date()}</td><td>{r['km']:.1f}</td>"
+        f"<td>{_hhmm(r['hours'] * 3600)}</td><td>{r['mean_watts']:.0f}</td>"
+        f"<td>{r['decay_watts_per_hour']:+.0f}</td>"
+        f"<td>{100 * r['weight'] / sum(x['weight'] for x in rides):.0f}%</td></tr>"
+        for r in fit["rides"]
+    )
+    table = ("<details><summary>The rides this prediction is built from</summary>"
+             "<table><thead><tr><th>Date</th><th>km</th><th>Moving</th>"
+             "<th>Mean W (est)</th><th>W/hour (est)</th><th>Weight</th></tr></thead>"
+             f"<tbody>{rows}</tbody></table></details>")
+
+    warnings = []
+    if beyond:
+        warnings.append(f"This route is predicted to take {_hhmm(seconds)}, longer than the "
+                        f"longest ride it learned from ({_hhmm(fit['longest_hours'] * 3600)}). "
+                        "The fade past that point is extrapolation, not evidence.")
+    if forecast["floored"]:
+        warnings.append("The modelled power hit its floor before the finish, so the last part "
+                        "of the route is predicted at that floor rather than at a fitted value.")
+    if forecast["crawled"]:
+        warnings.append("Somewhere on this route the model predicts under 1 m/s and was clamped "
+                        "there; a gradient that steep is probably being walked.")
+
+    foot = (
+        "Every ride is reduced to the power it started with and how fast that decayed, then "
+        f"averaged with recent rides counting for more (half-life {fit['half_life_days']:g} days, "
+        "weighted also by ride duration since a short ride cannot show a fade). That power is "
+        "played forward over this route's gradients. It is a prediction of <em>moving</em> time "
+        "with no wind, no drafting, no stops and no traffic, from a model whose mass and drag "
+        f"(<code>{params['mass']:g} kg</code>, <code>CdA {params['cda']:g}</code>) are guesses. "
+        "Treat it as a comparison between routes, not a time to aim at."
+        + "".join(f"<br><br><strong>{w}</strong>" for w in warnings)
+    )
+
+    charts.page(
+        args.out,
+        title=args.title or os.path.splitext(os.path.basename(args.route))[0] + " forecast",
+        subtitle=f"{x_max:.1f} km, {climb:.0f} m climbed, predicted {_hhmm(seconds)} moving "
+                 f"at {x_max / hours:.1f} km/h, from {len(rides)} recent rides",
+        tiles=f'<div class="tiles">{tiles}</div>',
+        charts="".join(blocks),
+        table=table,
+        foot=foot,
+        data={"km": [round(v, 3) for v in km], "ele": [round(v, 1) for v in ele],
+              "speed": [round(v, 2) for v in speed], "flat": [round(v, 2) for v in flat],
+              "grade": [round(v, 2) for v in grade], "elapsed": [round(v) for v in elapsed],
+              "geom": geom},
+        geometry={"w": charts.W, "left": charts.LEFT, "right": charts.RIGHT},
+    )
+
+    print(f"\n{x_max:.1f} km, {climb:.0f} m climbed")
+    print(f"From {len(rides)} rides, newest {fit['rides'][0]['date'].date()}: "
+          f"{fit['start_watts']:.0f} W start, {fit['decay_watts_per_hour']:+.1f} W/hour (est)")
+    print(f"Predicted moving time {_hhmm(seconds)} at {x_max / hours:.1f} km/h")
+    for w in warnings:
+        print(f"  ! {w}")
+    print(f"Wrote {os.path.abspath(args.out)}")
+    return 0
+
+
+def _ride_date(path):
+    for segment in read_samples(path):
+        for _, _, _, time in segment:
+            if time is not None:
+                return time
+    raise rideprofile.NotEnoughData(f"{path} has no timestamps")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="gpx", description="Tools for GPX tracks.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -375,10 +541,29 @@ def main(argv=None):
     f.add_argument("--title", help="page title (default: the file name)")
     f.set_defaults(func=cmd_profile)
 
+    r = sub.add_parser("predict", help="predict how long a route will take, from recent rides")
+    r.add_argument("route", help="GPX file of the route to predict")
+    r.add_argument("training", nargs="+", help="GPX files or a quoted glob of recent rides")
+    r.add_argument("-o", "--out", default="predict.html", help="output HTML (default: predict.html)")
+    r.add_argument("--half-life", type=float, default=predict.DEFAULT_HALF_LIFE,
+                   help="days after which a ride counts half as much (default: 42)")
+    r.add_argument("--min-minutes", type=float, default=20.0,
+                   help="ignore training rides shorter than this (default: 20)")
+    r.add_argument("--mass", type=float, help="rider plus bike, kg (default: 85)")
+    r.add_argument("--cda", type=float, help="drag area, m^2 (default: 0.32)")
+    r.add_argument("--crr", type=float, help="rolling resistance (default: 0.005)")
+    r.add_argument("--window", type=float, default=200.0,
+                   help="metres over which speed and gradient are measured (default: 200)")
+    r.add_argument("--smoothing", type=float, default=100.0,
+                   help="metres to smooth the displayed elevation over (default: 100)")
+    r.add_argument("--points", type=int, default=1500, help="samples plotted (default: 1500)")
+    r.add_argument("--title", help="page title (default: the route file name)")
+    r.set_defaults(func=cmd_predict)
+
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except rideprofile.NotEnoughData as exc:
+    except (rideprofile.NotEnoughData, predict.NotEnoughRides) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except strava.StravaError as exc:

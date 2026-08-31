@@ -17,3 +17,5 @@ build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# tests/ on the path so one test module can reuse another's simulator
+pythonpath = ["tests"]

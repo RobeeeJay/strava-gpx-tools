@@ -177,3 +177,42 @@ Charts are generated as SVG in Python with only the crosshair done in
 JavaScript, so the page has no chart-library dependency and what is drawn is
 exactly what was measured. Colours are slots 1 and 2 of the reference
 categorical palette, validated for both light and dark surfaces.
+
+## Predicting a route time (`gpx predict`)
+
+Each training ride is reduced to a starting power and a decay rate in watts per
+hour, fitted over its propulsive samples. Those are averaged with a weight of
+recency times duration, then played forward over the target route's gradients.
+Duration is in the weight because a twenty-minute ride cannot show a fade, and
+the fade is half of what is being fitted.
+
+Power decays with **elapsed time, not distance**. An hour of grinding uphill
+tires a rider as much as an hour of rolling along; it just covers less ground.
+The fit is also in power against time, so predicting against distance would not
+even be unit-consistent.
+
+Validated by hold-out, and keep it that way: the tests simulate a rider at a
+known power with a known fade, build a training history, then predict a route
+the model has never seen and compare against that rider's actual time on it.
+For steady form the prediction is exact — 230 W and -18 W/hour recovered from
+training, 1h 31m predicted against 1h 31m true.
+
+**The known weakness, measured.** A weighted average of past rides can never
+exceed the best of them, so a rider on an upward trend is always predicted
+slower than they are. For a rider improving 15 W a week: the newest ride alone
+gives +4 min on a 1h 31m route (irreducible, since that ride is already a week
+old), `--half-life 14` gives +11 min, and the 42-day default gives +14 min. The
+default stays at 42 days because it is the conventional fitness half-life and
+because a short half-life rests the estimate on fewer rides. Fitting a trend in
+fitness and extrapolating to today would close that gap and was deliberately not
+done: it turns one good week into a promise.
+
+The forward model `speed_for_power` caps descent speed, because the physics has
+no notion of braking, cornering or self-preservation, and floors the modelled
+power at half its starting value, because a linear decay run far enough goes
+negative. Both caps are reported on the page when they bite rather than being
+applied silently.
+
+The test simulator deliberately uses `test_rideprofile.speed_for`, an
+independent solver, rather than the production `speed_for_power`, so the
+analysis is not being checked against the code that generated its input.

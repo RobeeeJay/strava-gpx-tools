@@ -70,3 +70,41 @@ def filename_for(activity):
     local = activity.get("start_date_local") or activity["start_date"]
     day = parse_strava_time(local).strftime("%Y-%m-%d")
     return f"{day}-{slugify(activity.get('name'))}-{activity['id']}.gpx"
+
+
+# --- reading ----------------------------------------------------------------
+
+
+def _local(tag):
+    return tag.rsplit("}", 1)[-1]
+
+
+def read_tracks(path):
+    """Every track and route in a file, as lists of (lat, lon).
+
+    Segments are kept apart: a <trkseg> break is a real discontinuity (paused
+    recording), and joining them would invent a straight line nobody rode.
+    """
+    import xml.etree.ElementTree as ET
+
+    root = ET.parse(path).getroot()
+    tracks = []
+    for parent in root.iter():
+        tag = _local(parent.tag)
+        if tag not in ("trkseg", "rte"):
+            continue
+        point_tag = "trkpt" if tag == "trkseg" else "rtept"
+        points = [
+            (float(child.get("lat")), float(child.get("lon")))
+            for child in parent
+            if _local(child.tag) == point_tag and child.get("lat") and child.get("lon")
+        ]
+        if len(points) >= 2:
+            tracks.append(points)
+    return tracks
+
+
+def read_points(path):
+    """All tracks in a file flattened into one point list, for a route that is
+    logically continuous but split across segments."""
+    return [point for track in read_tracks(path) for point in track]

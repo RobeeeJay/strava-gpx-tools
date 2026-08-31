@@ -61,3 +61,37 @@ than written as empty tracks.
 ## Tests
 
     uv run --extra dev pytest
+
+## `gpx coverage`
+
+Colours a main route by whether you have ridden each part of it in training.
+
+    gpx coverage route.gpx "gpx/*.gpx" -o coverage.html
+
+- **orange** — never ridden
+- **blue** — ridden, but only in the opposite direction
+- **green** — ridden in the same direction as the route
+
+Green wins wherever both directions were ridden. Training files may be given as
+already-expanded shell arguments or as a quoted glob; the main route is dropped
+from the training set automatically, since a glob like `gpx/*.gpx` usually
+contains it and would otherwise colour everything green.
+
+### Matching
+
+The route is cut into segments of `--resolution` metres (default 15). A segment
+counts as ridden if a training track passes within `--tolerance` metres
+(default 25) *and* runs within `--angle` degrees of parallel (default 45). The
+angle test is what stops every road crossing the route from marking it as
+covered. Training jumps longer than `--max-gap` metres (default 200) are treated
+as paused recordings and ignored, so the straight line across a pause does not
+paint coverage along a road nobody rode.
+
+Distances use a local equirectangular projection in metres; over the span of a
+route the error is far below the GPS tolerance being worked to.
+
+The page is Leaflet over OpenStreetMap tiles, with a legend and per-colour
+distances and percentages. Every training track is drawn underneath in light
+grey, so you can see where you have been that the route does not go, with the
+coloured route always on top. Both layers can be toggled; `--no-training-layer`
+leaves the grey out entirely.

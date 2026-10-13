@@ -64,7 +64,16 @@ class _CallbackHandler(http.server.BaseHTTPRequestHandler):
     result = None
 
     def do_GET(self):
-        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        # Browsers follow the callback with a /favicon.ico request; recording
+        # that would replace the real callback with an empty one before the
+        # poll loop reads it, which surfaces as a state mismatch.
+        url = urllib.parse.urlparse(self.path)
+        if url.path != "/callback" or _CallbackHandler.result is not None:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        query = urllib.parse.parse_qs(url.query)
         _CallbackHandler.result = query
         body = b"Strava authorised. Close this tab and return to the terminal."
         if "code" not in query:

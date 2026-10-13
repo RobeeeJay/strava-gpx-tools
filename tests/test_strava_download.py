@@ -108,3 +108,40 @@ def test_filename_uses_local_date_not_utc():
 
 def test_slugify_survives_a_name_with_nothing_usable_in_it():
     assert slugify("!!!") == "activity"
+
+
+
+def _serve_callback(*paths):
+    import http.server
+    import threading
+    import urllib.error
+    import urllib.request
+
+    from geepeex import strava
+
+    strava._CallbackHandler.result = None
+    server = http.server.HTTPServer(("127.0.0.1", 0), strava._CallbackHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        for path in paths:
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{server.server_address[1]}{path}").read()
+            except urllib.error.HTTPError:
+                pass
+    finally:
+        server.shutdown()
+        server.server_close()
+    return strava._CallbackHandler.result
+
+
+def test_favicon_request_after_the_callback_does_not_erase_it():
+    # The browser asks for /favicon.ico straight after loading the callback
+    # page; if that overwrote the stored query, authorisation failed with
+    # "state mismatch" whenever it landed before the poll loop looked.
+    result = _serve_callback("/callback?state=abc&code=xyz", "/favicon.ico")
+    assert result == {"state": ["abc"], "code": ["xyz"]}, result
+
+
+def test_only_the_first_callback_counts():
+    result = _serve_callback("/callback?state=abc&code=xyz", "/callback?state=other")
+    assert result["state"] == ["abc"], result

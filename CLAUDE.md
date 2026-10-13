@@ -51,6 +51,11 @@ Gotchas that cost time and will again:
   elsewhere.
 - `datetime.fromisoformat` rejects `Z` before Python 3.11, hence
   `parse_strava_time`.
+- The OAuth callback server records only `/callback`, and only the first one.
+  Browsers request `/favicon.ico` right after the callback page loads; when
+  that was recorded too it replaced the real query with an empty one, and
+  authorisation failed with "state mismatch" whenever it landed inside the
+  0.2 s poll gap. Intermittent, so it hid behind earlier successful logins.
 
 ## Filtering
 

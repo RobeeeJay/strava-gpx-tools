@@ -8,6 +8,8 @@ subcommand of `gpx`.
 | Command | What it does |
 | --- | --- |
 | `gpx strava` | Download matching Strava activities as GPX into `./gpx` |
+| `gpx merge` | Merge recent Strava activities into one GPX, archiving the originals |
+| `gpx upload` | Upload a GPX to Strava once the activities it replaces are deleted |
 | `gpx coverage` | Colour a route by whether you have ridden it in training, as a webpage |
 | `gpx profile` | Elevation, speed and gradient-adjusted speed for one ride, as a webpage |
 | `gpx predict` | Predict how long a route will take, from your recent rides |
@@ -92,6 +94,43 @@ stops, reports how many were written, and tells you to re-run after the window
 resets — already-downloaded files are skipped on the retry. Activities with no
 `latlng` stream (trainer rides, pool swims) are reported and skipped rather
 than written as empty tracks.
+
+---
+
+## `gpx merge` and `gpx upload`
+
+For when one ride was recorded as several activities. `gpx merge` lists your
+last 20 activities (`-n` for more), asks which to join, archives each of them
+in full, and writes one GPX with a track segment per original:
+
+    uv run gpx merge -n 10
+    ...
+    Wrote gpx/merged/2026-10-10-coast-and-back-merged.gpx
+    To upload later: gpx upload gpx/merged/2026-10-10-coast-and-back-merged.gpx --replaces 101,102
+
+It then offers to upload. **Strava's API cannot delete activities**, and Strava
+rejects an upload whose track duplicates one still on the account, so the
+originals must be deleted by hand on strava.com first. The upload step lists
+their links, waits while you delete them, checks that each one is really gone,
+and only then uploads. It refuses to run at all for any `--replaces` id that
+has no archive in `gpx/archive`.
+
+The archive is `gpx/archive/<date>-<name>-<id>.json` and `.gpx`. The JSON holds
+everything the API gives: the activity details (with laps and splits), every
+stream (heart rate, cadence, power, temperature, distance, moving, smoothed
+speed and grade), the comments, and who gave kudos. The GPX beside it carries
+heart rate, cadence and temperature as Garmin TrackPointExtension and power as
+`<power>`, so it can be re-uploaded on its own. Deleting still loses things no
+archive can keep: the kudos and comments themselves, photos, segment efforts,
+and the original device file.
+
+Uploading needs `activity:write`, which `gpx strava` never asks for, so the first
+upload sends you through the browser consent once more. The merged activity is
+named after the first original (or what you type) and given its sport;
+descriptions of the originals are joined.
+
+Checked against Strava on a real merge: deleted activities answer 404, and heart
+rate, cadence and power from the GPX all came back on the uploaded activity.
 
 ---
 
@@ -295,7 +334,7 @@ that point is extrapolation and is called out as such.
     uv run --extra dev pytest
 
 The network path to Strava is not covered — tests exercise the pure logic
-(filtering, GPX construction, filename derivation, coverage classification and
+(filtering, GPX construction, filename derivation, merging and archiving, coverage classification and
 page rendering) against literal fixtures.
 
 ## Layout
@@ -305,6 +344,7 @@ page rendering) against literal fixtures.
 | `geepeex/cli.py` | The `gpx` command and its subcommands |
 | `geepeex/strava.py` | OAuth, activity listing, stream fetching, filtering |
 | `geepeex/gpxfile.py` | Reading and writing GPX |
+| `geepeex/merge.py` | Choosing activities to merge, checking they can be, archiving them |
 | `geepeex/coverage.py` | Deciding which parts of a route were ridden, and which way |
 | `geepeex/mapview.py` | Rendering a coverage result as a Leaflet page |
 | `geepeex/predict.py` | Fitness from past rides, played forward over a route |

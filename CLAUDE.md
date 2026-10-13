@@ -84,6 +84,36 @@ Rate limits are 100 requests / 15 min and 1000 / day. On a 429 the run **stops
 and reports** rather than sleeping until the window resets: a silent multi-minute
 sleep is worse than an honest exit when re-running is free.
 
+## Merging and uploading (`gpx merge`, `gpx upload`)
+
+**The API has no DELETE for activities** (removed around 2017; not in the
+current reference). Replacing activities with a merged one therefore needs the
+rider to delete them on strava.com, and the upload cannot go first: Strava
+rejects a track duplicating one still on the account ("duplicate of activity
+N"). Scraping the website to delete was rejected — fragile and against the API
+terms.
+
+Three rules make the manual step safe:
+
+- **Nothing is offered for deletion without a local archive.** `upload` refuses
+  any `--replaces` id with no `<out>/archive/*-<id>.json`. The JSON is written
+  last, so its presence marks a complete archive and doubles as the resume
+  marker, as existing GPX files do for `gpx strava`.
+- **Deletion is verified, not assumed.** The upload waits until
+  `GET /activities/{id}` answers 404 for every replaced id. A deleted activity
+  gives `404 Record Not Found`, observed on two real deletions.
+- **Write scope is asked for only by `upload`.** `gpx strava` keeps
+  `activity:read_all`; read-only use never holds write access. Strava reports
+  granted scope space-separated on refresh and comma-separated on the callback,
+  hence `has_scope`.
+
+The archive keeps the raw API JSON, not just a GPX, because the GPX format has
+no place for laps, comments or kudos. Merged files keep one `<trkseg>` per
+original so the gap between recordings is not drawn as ridden. Sport type is
+not an upload field, so it is set by `PUT` afterwards; the prompt only accepts
+one of the originals' sports because a typo would otherwise only surface after
+the upload had gone through.
+
 ## Credentials
 
 Stored at `~/.config/geepeex/strava.json`, mode 0600, holding client id/secret

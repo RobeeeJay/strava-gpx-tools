@@ -8,6 +8,7 @@ trackpoints ourselves (see gpxfile.build_gpx).
 import http.server
 import json
 import os
+import re
 import secrets
 import stat
 import threading
@@ -21,6 +22,12 @@ API = "https://www.strava.com/api/v3"
 OAUTH = "https://www.strava.com/oauth"
 # activity:read_all rather than activity:read, or private activities are invisible.
 SCOPE = "activity:read_all"
+# Only asked for when uploading, so read-only use never holds write access.
+WRITE_SCOPE = "activity:read_all,activity:write"
+# Everything the streams endpoint will give, for archiving an activity before it
+# is deleted. The plain download only needs latlng,altitude,time.
+ALL_STREAMS = ("time,latlng,altitude,distance,heartrate,cadence,watts,temp,"
+               "moving,velocity_smooth,grade_smooth")
 CALLBACK_PORT = 8721
 REDIRECT_URI = f"http://localhost:{CALLBACK_PORT}/callback"
 
@@ -37,6 +44,21 @@ class StravaError(Exception):
 
 class RateLimited(StravaError):
     pass
+
+
+class NotFound(StravaError):
+    pass
+
+
+class UploadFailed(StravaError):
+    pass
+
+
+def has_scope(config, wanted):
+    """Strava records granted scope space-separated on refresh, comma-separated
+    on the OAuth callback; accept either."""
+    granted = set(re.split(r"[ ,]+", config.get("scope") or ""))
+    return all(part in granted for part in wanted.split(","))
 
 
 # --- credential storage -----------------------------------------------------
@@ -88,7 +110,7 @@ class _CallbackHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def authorize(client_id, client_secret, timeout=300):
+def authorize(client_id, client_secret, scope=SCOPE, timeout=300):
     """Run the OAuth code flow against a throwaway localhost server.
 
     The Strava app's "Authorization Callback Domain" must be set to `localhost`
@@ -100,7 +122,7 @@ def authorize(client_id, client_secret, timeout=300):
         "redirect_uri": REDIRECT_URI,
         "response_type": "code",
         "approval_prompt": "auto",
-        "scope": SCOPE,
+        "scope": scope,
         "state": state,
     }
     url = f"{OAUTH}/authorize?" + urllib.parse.urlencode(params)
@@ -142,7 +164,9 @@ def authorize(client_id, client_secret, timeout=300):
     )
     if not response.ok:
         raise StravaError(f"token exchange failed: {response.status_code} {response.text}")
-    return response.json()
+    token = response.json()
+    token.setdefault("scope", granted)
+    return token
 
 
 # --- client -----------------------------------------------------------------
@@ -179,12 +203,13 @@ class StravaClient:
             self._on_config_change(self.config)
         return self.config["access_token"]
 
-    def get(self, path, **params):
-        response = self.session.get(
+    def _request(self, method, path, **kwargs):
+        response = self.session.request(
+            method,
             f"{API}{path}",
             headers={"Authorization": f"Bearer {self._access_token()}"},
-            params=params,
             timeout=60,
+            **kwargs,
         )
         self.usage = response.headers.get("X-RateLimit-Usage")
         if response.status_code == 429:
@@ -195,10 +220,13 @@ class StravaClient:
                 "already-downloaded files are skipped."
             )
         if response.status_code == 404:
-            raise StravaError(f"not found: {path}")
+            raise NotFound(f"not found: {path}")
         if not response.ok:
             raise StravaError(f"{path} failed: {response.status_code} {response.text}")
         return response.json()
+
+    def get(self, path, **params):
+        return self._request("GET", path, params=params)
 
     def activities(self, after=None, before=None, page_size=200, max_pages=100):
         """Page through /athlete/activities newest-first until Strava runs dry."""
@@ -223,6 +251,70 @@ class StravaClient:
             keys="latlng,altitude,time",
             key_by_type="true",
         )
+
+    def snapshot(self, activity_id):
+        """Everything the API will give about one activity, for keeping before it
+        is deleted. The detail record already carries laps and splits."""
+        return {
+            "activity": self.get(f"/activities/{activity_id}"),
+            "streams": self.get(f"/activities/{activity_id}/streams",
+                                keys=ALL_STREAMS, key_by_type="true"),
+            "comments": self.get(f"/activities/{activity_id}/comments"),
+            "kudos": self.get(f"/activities/{activity_id}/kudos"),
+        }
+
+    def exists(self, activity_id):
+        # A deleted activity answers 404 "Record Not Found", the same as an id
+        # that never existed.
+        try:
+            self.get(f"/activities/{activity_id}")
+        except NotFound:
+            return False
+        return True
+
+    def upload(self, path, name=None, description=None):
+        data = {"data_type": "gpx", "external_id": os.path.basename(path)}
+        if name:
+            data["name"] = name
+        if description:
+            data["description"] = description
+        with open(path, "rb") as fh:
+            return self._request("POST", "/uploads", data=data, files={"file": fh})
+
+    def wait_for_upload(self, upload, timeout=120, interval=1.5):
+        """Uploads are processed asynchronously; Strava asks for polls no faster
+        than once a second."""
+        deadline = time.time() + timeout
+        while True:
+            activity_id = upload_outcome(upload)
+            if activity_id is not None:
+                return activity_id
+            if time.time() > deadline:
+                raise UploadFailed(
+                    f"upload {upload['id']} still processing after {timeout}s; "
+                    "check https://www.strava.com/athlete/training before retrying"
+                )
+            time.sleep(interval)
+            upload = self.get(f"/uploads/{upload['id']}")
+
+    def set_sport(self, activity_id, sport_type):
+        return self._request("PUT", f"/activities/{activity_id}", json={"sport_type": sport_type})
+
+
+def upload_outcome(status):
+    """The new activity id once processing is done, None while it is pending.
+
+    A duplicate is the likely failure here: Strava rejects a track that matches
+    an activity still on the account, which means an original was not deleted.
+    """
+    if status.get("error"):
+        message = status["error"]
+        found = re.search(r"duplicate of (?:<a [^>]*>)?activity (\d+)", message)
+        if found:
+            message += (f"\nStrava still holds https://www.strava.com/activities/{found.group(1)}"
+                        "; delete it and run the upload again.")
+        raise UploadFailed(message)
+    return status.get("activity_id")
 
 
 # --- filtering --------------------------------------------------------------

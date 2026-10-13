@@ -2,13 +2,14 @@
 
 import argparse
 import glob
+import itertools
 import os
 import sys
 from collections import Counter
 
-from . import charts, coverage, mapview, predict, rideprofile, strava
-from .gpxfile import (NoGpsData, build_gpx, filename_for, parse_strava_time,
-                      read_points, read_samples, read_tracks)
+from . import charts, coverage, merge, mapview, predict, rideprofile, strava
+from .gpxfile import (NoGpsData, build_gpx, filename_for, merge_gpx, parse_strava_time,
+                      read_metadata, read_points, read_samples, read_tracks, slugify)
 
 DEFAULT_OUT = "gpx"
 
@@ -29,7 +30,7 @@ def _confirm(question):
     return _prompt(f"{question} [y/N] ").lower() in ("y", "yes")
 
 
-def _ensure_credentials(reauth=False):
+def _ensure_credentials(reauth=False, scope=strava.SCOPE):
     config = strava.load_config()
     have_app = config.get("client_id") and config.get("client_secret")
 
@@ -45,9 +46,18 @@ def _ensure_credentials(reauth=False):
             raise strava.StravaError("client id and secret are both required")
         reauth = True
 
+    # Only checked for the write scope: configs saved before scope was recorded
+    # would otherwise force every read-only user back through the browser.
+    if scope != strava.SCOPE and not strava.has_scope(config, scope):
+        print(f"This needs Strava permission {scope}, which has not been granted yet.")
+        reauth = True
+
     if reauth or not config.get("refresh_token"):
-        config.update(strava.authorize(config["client_id"], config["client_secret"]))
+        config.update(strava.authorize(config["client_id"], config["client_secret"], scope=scope))
         config.pop("athlete", None)  # bulky and never read back
+        if scope != strava.SCOPE and not strava.has_scope(config, scope):
+            strava.save_config(config)
+            raise strava.StravaError(f"Strava did not grant {scope}; tick every box on the consent page")
 
     strava.save_config(config)
     print(f"Credentials stored in {strava.CONFIG_PATH}")
@@ -130,6 +140,127 @@ def cmd_strava(args):
         f"\nDone: {written} written, {skipped} already present, {no_gps} without GPS."
         + (f"\nRate limit usage: {client.usage}" if client.usage else "")
     )
+    return 0
+
+
+def _local_day(activity):
+    return parse_strava_time(activity.get("start_date_local") or activity["start_date"]).strftime("%Y-%m-%d")
+
+
+def cmd_merge(args):
+    config = _ensure_credentials(reauth=args.reauth)
+    client = strava.StravaClient(config, on_config_change=strava.save_config)
+
+    recent = list(itertools.islice(client.activities(), args.last))
+    if not recent:
+        print("No activities on the account.")
+        return 1
+    print(f"\nLast {len(recent)} activities, newest first:\n")
+    _print_table(recent)
+
+    picked = [recent[i] for i in merge.parse_selection(
+        _prompt("\nActivities to merge (e.g. 2,3 or 2-4): "), len(recent))]
+    picked.sort(key=lambda a: a["start_date"])
+    archive_dir = os.path.join(args.out, "archive")
+    print(f"\nWill archive in full to {os.path.abspath(archive_dir)} and merge, in this order:\n")
+    _print_table(picked)
+    if not _confirm("\nContinue?"):
+        print("Cancelled. Nothing fetched.")
+        return 1
+
+    snapshots = []
+    for activity in picked:
+        path = merge.find_archive(archive_dir, activity["id"])
+        if path:
+            print(f"  already archived: {path}")
+        else:
+            try:
+                path = merge.save_archive(archive_dir, client.snapshot(activity["id"]))
+            except strava.RateLimited as exc:
+                print(f"\n{exc}\nArchives written so far are kept; re-run to carry on.")
+                return 2
+            print(f"  archived: {path}")
+        snapshots.append(merge.load_archive(path))
+
+    parts = merge.check_mergeable([(s["activity"], s["streams"]) for s in snapshots])
+    first = parts[0][0]
+    sports = list(dict.fromkeys(strava.sport_of(a) for a, _ in parts))
+    if len(sports) > 1:
+        print(f"\nThese are different sports: {', '.join(sports)}.")
+    name = args.name or _prompt(f"\nName for the merged activity [{first.get('name')}]: ", first.get("name"))
+    sport = args.sport or (sports[0] if len(sports) == 1 else
+                           _prompt(f"Sport type, one of {', '.join(sports)} [{sports[0]}]: ", sports[0]))
+    # Anything else is only checked by Strava after the upload has gone through.
+    if not args.sport and sport not in sports:
+        raise merge.CannotMerge(f"{sport!r} is not one of {', '.join(sports)}; use --sport for another")
+    desc = "\n\n".join(a["description"] for a, _ in parts if a.get("description"))
+
+    out = os.path.join(args.out, "merged", f"{_local_day(first)}-{slugify(name)}-merged.gpx")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "w") as fh:
+        fh.write(merge_gpx(parts, name, sport, desc))
+    ids = ",".join(str(a["id"]) for a, _ in parts)
+    print(f"\nWrote {out}")
+    print(f"To upload later: gpx upload {out} --replaces {ids}")
+
+    if not _confirm("\nUpload it to Strava now? The originals have to be deleted by hand first."):
+        return 0
+    return _replace_and_upload(out, [a["id"] for a, _ in parts], archive_dir)
+
+
+def cmd_upload(args):
+    if not os.path.isfile(args.gpx):
+        raise strava.StravaError(f"not found: {args.gpx}")
+    return _replace_and_upload(args.gpx, args.replaces or [], args.archive, reauth=args.reauth)
+
+
+def _replace_and_upload(path, replaces, archive_dir, reauth=False):
+    """Upload `path` once every activity it replaces is archived locally and
+    gone from Strava. Strava rejects a track duplicating one still on the
+    account, and its API cannot delete, so the deleting is the rider's."""
+    archives = {i: merge.find_archive(archive_dir, i) for i in replaces}
+    missing = [str(i) for i, p in archives.items() if not p]
+    if missing:
+        raise strava.StravaError(
+            f"no local archive in {archive_dir} for {', '.join(missing)}; "
+            "refusing to have anything deleted that is not kept here first"
+        )
+
+    config = _ensure_credentials(reauth=reauth, scope=strava.WRITE_SCOPE)
+    client = strava.StravaClient(config, on_config_change=strava.save_config)
+
+    remaining = [i for i in replaces if client.exists(i)]
+    if remaining:
+        print(
+            "\nThese activities are still on Strava and must be deleted before the upload.\n"
+            "Deleting them loses kudos, comments, photos, segment efforts and the original\n"
+            "device file. The local archive keeps the track, every sensor stream, the\n"
+            "activity details, laps, comments and the list of who gave kudos.\n"
+        )
+        for i in remaining:
+            print(f"  https://www.strava.com/activities/{i}\n    archived in {archives[i]}")
+        if not _confirm("\nDelete these yourself on Strava, then come back. Go ahead?"):
+            print("Stopped. Nothing uploaded.")
+            return 1
+    while remaining:
+        if _prompt("\nPress Enter once they are deleted (q to stop): ").lower() == "q":
+            print("Stopped. Nothing uploaded.")
+            return 1
+        remaining = [i for i in remaining if client.exists(i)]
+        for i in remaining:
+            print(f"  still on Strava: https://www.strava.com/activities/{i}")
+
+    meta = read_metadata(path)
+    print(f"\nUploading {path}...")
+    activity_id = client.wait_for_upload(client.upload(path, meta.get("name"), meta.get("desc")))
+    # Not a documented upload field; set afterwards so the merged activity
+    # keeps the originals' sport rather than whatever Strava guesses.
+    print(f"Uploaded: https://www.strava.com/activities/{activity_id}")
+    if meta.get("type"):
+        try:
+            client.set_sport(activity_id, meta["type"])
+        except strava.StravaError as exc:
+            print(f"warning: could not set sport to {meta['type']!r}, set it on Strava: {exc}")
     return 0
 
 
@@ -512,6 +643,23 @@ def main(argv=None):
     p.add_argument("--reauth", action="store_true", help="redo the Strava browser authorisation")
     p.set_defaults(func=cmd_strava)
 
+    m = sub.add_parser("merge", help="merge recent Strava activities into one GPX, optionally uploading it")
+    m.add_argument("-n", "--last", type=int, default=20, help="how many recent activities to list (default: 20)")
+    m.add_argument("-o", "--out", default=DEFAULT_OUT,
+                   help=f"folder for archive/ and merged/ (default: {DEFAULT_OUT})")
+    m.add_argument("--name", help="name of the merged activity (default: prompt)")
+    m.add_argument("--sport", help="sport type of the merged activity (default: the originals')")
+    m.add_argument("--reauth", action="store_true", help="redo the Strava browser authorisation")
+    m.set_defaults(func=cmd_merge)
+
+    u = sub.add_parser("upload", help="upload a GPX to Strava, after the activities it replaces are deleted")
+    u.add_argument("gpx", help="GPX file to upload")
+    u.add_argument("--replaces", type=lambda v: [int(i) for i in _split(v)], help="comma separated ids that must be archived and deleted first")
+    u.add_argument("--archive", default=os.path.join(DEFAULT_OUT, "archive"),
+                   help=f"where the archives of replaced activities are (default: {DEFAULT_OUT}/archive)")
+    u.add_argument("--reauth", action="store_true", help="redo the Strava browser authorisation")
+    u.set_defaults(func=cmd_upload)
+
     c = sub.add_parser("coverage", help="colour a route by whether it was ridden in training")
     c.add_argument("main", help="GPX file of the main route")
     c.add_argument("training", nargs="+", help="GPX files or a quoted glob of training rides")
@@ -566,7 +714,7 @@ def main(argv=None):
     except (rideprofile.NotEnoughData, predict.NotEnoughRides) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    except strava.StravaError as exc:
+    except (strava.StravaError, merge.CannotMerge) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
